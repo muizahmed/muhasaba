@@ -436,6 +436,10 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
 .days button.on { background: var(--green); border-color: var(--green); color: var(--on-green); }
 .lrow { display: grid; grid-template-columns: minmax(0, 1fr) 84px 40px; gap: 8px; align-items: center; }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.savelog { display: flex; flex-direction: column; gap: 4px; padding-top: 10px; border-top: 1px solid var(--line); }
+.savelog-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.savelog-title { font-size: 12px; font-weight: 600; color: var(--muted); }
+.savelog-row { font-size: 12px; color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; }
 .err { font-size: 13px; font-weight: 600; color: var(--over-fg); }
 .check { display: flex; align-items: center; gap: 10px; font-size: 14px; }
 .check input { width: 20px; height: 20px; accent-color: var(--green); }
@@ -597,6 +601,8 @@ var DATA = null;
   var flushTimer = null;
   var pendingEdits = 0;
   var failedEdits = [];
+  /* Automatic retry of failed saves (see Retry below): tries used so far, the one timer, when the app last came back. */
+  var retryTries = 0, retryTimer = null, returnedAt = 0;
   var today = startOfToday();
 
   /* ---------- dates ---------- */
@@ -842,6 +848,9 @@ var DATA = null;
     queue.push({ date: k, kind: kind, key: key, value: hasValue(value) ? value : null });
     /* Logging a habit clears its "not doing today" mark. */
     if (kind === 'v' && hasValue(value) && day.s[key]) { delete day.s[key]; queue.push({ date: k, kind: 's', key: key, value: null }); }
+    editSeq++;
+    persistPending();
+    scheduleCache();
     state.sync = 'saving';
     if (flushTimer) clearTimeout(flushTimer);
     flushTimer = setTimeout(flush, 1000);
@@ -849,7 +858,8 @@ var DATA = null;
     render();
     afterHabitChange(ch, wasFull, before, catWas);
   }
-  function flush() {
+  /* keep === true is the send on leaving the page: the request is allowed to outlive it (fetch keepalive). */
+  function flush(keep) {
     flushTimer = null;
     if (inFlight || !queue.length) return;
     var batch = queue.slice();
@@ -859,20 +869,31 @@ var DATA = null;
     api('applyChanges', batch, function () {
       queue.splice(0, batch.length);
       inFlight = false;
+      persistPending();
+      retryTries = 0;
       if (queue.length) { flush(); } else { syncDone(); renderPill(); }
-    }, function () {
+    }, function (kind, info) {
       inFlight = false;
-      state.sync = 'error';
+      noteFail('applyChanges', kind, info);
+      state.sync = failShown(kind);
       renderPill();
-    });
+    }, keep === true);
   }
+  /* Fresh data from the server, swapped in only if nothing is unsaved now and nothing was edited since the
+     request went out (an older answer must never undo a newer local change). Failures are silent. Returns
+     true if a request was sent. */
   function refresh() {
-    if (!DATA || !getKey() || queue.length || inFlight || pendingEdits) return;
+    if (!DATA || !getKey() || unsaved()) return false;
+    var seq = editSeq;
     api('getData', null, function (d) {
-      if (queue.length || inFlight || pendingEdits || !d) return;
+      if (!d || !d.habits) return;
+      /* Thrown away because of a local change: fetch once more as soon as everything is saved (syncDone picks it up if not yet). */
+      if (unsaved() || seq !== editSeq) { convergeAfter = true; setTimeout(converge, 0); return; }
       DATA = d;
-      render();
+      writeCache();
+      keepScroll(render);
     }, function () {});
+    return true;
   }
 
   /* ---------- server transport, sign-in and start-up ---------- */
@@ -889,34 +910,191 @@ var DATA = null;
       if (memKey) { window.localStorage.setItem('muhasaba:key', memKey); } else { window.localStorage.removeItem('muhasaba:key'); }
     } catch (e) {}
   }
-  function post(body, onOk, onFail) {
-    var done = false;
-    function fail(kind) { if (!done) { done = true; onFail(kind); } }
+  /* A call with no answer after this long counts as a network failure; an answer that comes later is ignored. */
+  var API_TIMEOUT_MS = 30000;
+  /* A failed save is tried again by itself after these gaps (ms), one try per entry; when they are used up the pill
+     reads "Not saved, tap to retry". */
+  var RETRY_DELAYS_MS = [2000, 6000, 15000];
+  /* keep === true adds fetch's keepalive, so the request can finish after the page is closed or hidden. */
+  function post(body, onOk, onFail, keep) {
+    var done = false, timer = null;
+    function fail(kind) { if (!done) { done = true; if (timer) clearTimeout(timer); onFail(kind); } }
+    function ok(result) { if (!done) { done = true; if (timer) clearTimeout(timer); onOk(result); } }
     if (!API_URL) { setTimeout(function () { fail('noapi'); }, 0); return; }
     var req;
     try {
-      req = window.fetch(API_URL, { method: 'POST', body: JSON.stringify(body) });
+      var opts = { method: 'POST', body: JSON.stringify(body) };
+      if (keep) opts.keepalive = true;
+      req = window.fetch(API_URL, opts);
     } catch (e) {
       setTimeout(function () { fail('network'); }, 0);
       return;
     }
-    req.then(function (res) { return res.json(); }).then(function (j) {
-      if (j && j.ok === true) { if (!done) { done = true; onOk(j.result); } } else { fail(j && j.error ? String(j.error) : 'bad'); }
+    timer = setTimeout(function () { fail('timeout'); }, API_TIMEOUT_MS);
+    var BAD = {};
+    req.then(function (res) { return res.json().then(null, function () { return BAD; }); }).then(function (j) {
+      if (j === BAD) { fail('nonjson'); }
+      else if (j && j.ok === true) { ok(j.result); } else { fail(j && j.error ? String(j.error) : 'bad'); }
     }, function () { fail('network'); });
   }
-  function api(fn, arg, onOk, onFail) {
-    var key = getKey();
-    if (!key) { setTimeout(function () { onFail('auth'); }, 0); return; }
+  /* onFail(kind, info): kind is 'network' (fetch rejected), 'timeout', 'nonjson' (an answer that is not JSON), 'auth',
+     'noapi' or the server's error text; info = { ctx: 'hidden' | 'returned' | 'visible' as the call went out, ms: how
+     long it took to fail }. Callers that only look at kind are unchanged. */
+  function api(fn, arg, onOk, onFail, keep) {
+    var key = getKey(), t0 = Date.now(), info = { ctx: keep === true ? 'hidden' : pageCtx(), ms: 0 };
+    if (!key) { setTimeout(function () { onFail('auth', info); }, 0); return; }
     post({ fn: fn, arg: arg === undefined ? null : arg, key: key }, onOk, function (kind) {
+      info.ms = Date.now() - t0;
       if (kind === 'auth' && getKey() === key) needSignIn();
-      onFail(kind);
-    });
+      onFail(kind, info);
+    }, keep);
   }
   function needSignIn() {
+    cancelRetry();
     setKey('');
+    /* The data copy goes with the key; unsent changes stay and go out after signing in again. */
+    if (cacheTimer) { clearTimeout(cacheTimer); cacheTimer = null; }
+    lsDel(CACHE_KEY);
     showGate('signin');
   }
   function unsaved() { return !!(queue.length || inFlight || pendingEdits || failedEdits.length || callQueue.length); }
+
+  /* ---------- a copy on the device: the data, and everything not yet confirmed by the server ----------
+     muhasaba:cache   {v, data}: the last DATA, so the app opens at once (never shown without a session key).
+     muhasaba:pending {v, q, c}: q = habit changes not confirmed (including a batch on its way), c = server calls not
+     confirmed in their original order (failed ones, the one on its way, then the queue). Written on every change
+     and cleared only when the server confirms. On start-up they are restored before anything is sent, laid over the
+     data on screen (all of it is idempotent: sets, upserts by id, deletes), and sent through the normal paths.
+     Every storage access is in try/catch: with storage blocked or full the app works as before. */
+  var LOCAL_V = 1, CACHE_KEY = 'muhasaba:cache', PENDING_KEY = 'muhasaba:pending', CACHE_DELAY_MS = 400;
+  var cacheTimer = null, editSeq = 0, restoreDone = false, restoredPending = false, convergeAfter = false;
+  var KNOWN_CALLS = { saveHabits: 'rows', saveCategories: 'rows', saveTodos: 'rows', saveLabels: 'rows', deleteTodos: 'ids', deleteCategory: 'id', deleteLabel: 'id', saveSettings: 'obj' };
+  function lsGet(k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { window.localStorage.setItem(k, v); return true; } catch (e) { return false; } }
+  function lsDel(k) { try { window.localStorage.removeItem(k); } catch (e) {} }
+  function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
+  function readCache() {
+    var raw = lsGet(CACHE_KEY);
+    if (!raw) return null;
+    try {
+      var o = JSON.parse(raw), d = o && o.v === LOCAL_V ? o.data : null;
+      if (isObj(d) && Array.isArray(d.habits) && Array.isArray(d.categories) && isObj(d.days) && isObj(d.settings)) return d;
+    } catch (e) {}
+    lsDel(CACHE_KEY);
+    return null;
+  }
+  function writeCache() {
+    if (cacheTimer) { clearTimeout(cacheTimer); cacheTimer = null; }
+    if (!DATA || !getKey()) return;
+    try {
+      if (!lsSet(CACHE_KEY, JSON.stringify({ v: LOCAL_V, data: DATA }))) lsDel(CACHE_KEY);
+    } catch (e) { lsDel(CACHE_KEY); }
+  }
+  /* After a change to DATA: the cache (and the rows inside unsent to-do saves) are rewritten shortly after the last one. */
+  function scheduleCache() {
+    if (cacheTimer) clearTimeout(cacheTimer);
+    cacheTimer = setTimeout(function () { cacheTimer = null; writeCache(); persistPending(); }, CACHE_DELAY_MS);
+  }
+  /* Server calls not confirmed, in their original order: failed ones first (they failed before anything still waiting
+     started), then the one on its way, then the queue. */
+  function unconfirmedCalls() {
+    var list = failedEdits.slice();
+    if (curCall) list.push(curCall);
+    return list.concat(callQueue);
+  }
+  function persistPending() {
+    if (!DATA) return;
+    try {
+      var src = unconfirmedCalls(), calls = [], i;
+      for (i = 0; i < src.length; i++) {
+        if (src[i].fn === 'saveTodos') {
+          /* As nextCall does when it sends: rows as they are now, to-dos deleted since left out. */
+          var rows = src[i].arg.filter(function (x) { return !!todoById(x.id); });
+          if (rows.length) calls.push({ fn: 'saveTodos', arg: rows });
+        } else {
+          calls.push({ fn: src[i].fn, arg: src[i].arg });
+        }
+      }
+      if (!queue.length && !calls.length) { lsDel(PENDING_KEY); return; }
+      lsSet(PENDING_KEY, JSON.stringify({ v: LOCAL_V, q: queue, c: calls }));
+    } catch (e) {}
+  }
+  function goodChange(x) { return isObj(x) && typeof x.date === 'string' && typeof x.key === 'string' && /^[vans]$/.test(x.kind); }
+  function goodCall(x) {
+    var t = isObj(x) ? KNOWN_CALLS[x.fn] : '';
+    if (!t || !KNOWN_CALLS.hasOwnProperty(x.fn)) return false;
+    if (t === 'id') return typeof x.arg === 'string';
+    if (t === 'obj') return isObj(x.arg);
+    if (!Array.isArray(x.arg)) return false;
+    for (var i = 0; i < x.arg.length; i++) { if (t === 'rows' ? !(isObj(x.arg[i]) && typeof x.arg[i].id === 'string') : typeof x.arg[i] !== 'string') return false; }
+    return true;
+  }
+  /* Once per page load, before anything is sent. Everything restored waits in queue / failedEdits (a restored call
+     is just a failed one that has not been retried yet); sendRestored() sends it once the data is on screen. */
+  function restorePending() {
+    if (restoreDone) return;
+    restoreDone = true;
+    var raw = lsGet(PENDING_KEY), o = null;
+    if (!raw) return;
+    try { o = JSON.parse(raw); } catch (e) { o = null; }
+    if (!isObj(o) || o.v !== LOCAL_V) return;
+    queue = Array.isArray(o.q) ? o.q.filter(goodChange) : [];
+    failedEdits = Array.isArray(o.c) ? o.c.filter(goodCall) : [];
+    if (queue.length || failedEdits.length) {
+      restoredPending = true;
+      state.sync = getKey() ? 'saving' : 'error';
+    }
+  }
+  function applyChangeTo(data, ch) {
+    var day = data.days[ch.date];
+    if (!day) { day = { v: {}, a: {}, n: {}, s: {} }; data.days[ch.date] = day; }
+    if (!day[ch.kind]) day[ch.kind] = {};
+    if (hasValue(ch.value)) { day[ch.kind][ch.key] = ch.value; } else { delete day[ch.kind][ch.key]; }
+  }
+  /* The row objects of a restored call become the ones in DATA, as they are in a live session. */
+  function upsertRows(list, rows) {
+    for (var i = 0; i < rows.length; i++) {
+      var at = -1;
+      for (var j = 0; j < list.length; j++) { if (list[j].id === rows[i].id) at = j; }
+      if (at < 0) { list.push(rows[i]); } else { list[at] = rows[i]; }
+    }
+  }
+  function without(list, ids) { return list.filter(function (x) { return ids.indexOf(x.id) < 0; }); }
+  function applyCallTo(data, c) {
+    var a = c.arg;
+    if (c.fn === 'saveHabits') { upsertRows(data.habits, a); }
+    else if (c.fn === 'saveCategories') { upsertRows(data.categories, a); }
+    else if (c.fn === 'saveTodos') { if (!data.todos) data.todos = []; upsertRows(data.todos, a); }
+    else if (c.fn === 'saveLabels') { if (!data.labels) data.labels = []; upsertRows(data.labels, a); }
+    else if (c.fn === 'deleteTodos') { data.todos = without(data.todos || [], a); }
+    else if (c.fn === 'deleteCategory') { data.categories = without(data.categories, [a]); }
+    else if (c.fn === 'deleteLabel') { data.labels = without(data.labels || [], [a]); }
+    else if (c.fn === 'saveSettings') { for (var k in a) { if (a.hasOwnProperty(k)) data.settings[k] = a[k]; } }
+  }
+  /* Lays the restored changes over DATA (the cache or fresh from the server) so the screen matches what will be saved. */
+  function applyPending() {
+    if (!restoredPending || !DATA) return;
+    restoredPending = false;
+    var i;
+    for (i = 0; i < failedEdits.length; i++) applyCallTo(DATA, failedEdits[i]);
+    for (i = 0; i < queue.length; i++) applyChangeTo(DATA, queue[i]);
+  }
+  /* Sends what was restored (the same path as tapping retry), then one background refresh once it all settles. */
+  function sendRestored() {
+    if (!unsaved()) return false;
+    convergeAfter = true;
+    retryAll();
+    return true;
+  }
+  /* Leaving the page (or hiding it): write the copy first, synchronously, then send the habit queue at once. */
+  function leaving() {
+    if (!DATA) return;
+    writeCache();
+    persistPending();
+    if (!getKey()) return;
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    flush(true);
+  }
 
   var gsiReady = false, gsiTries = 0;
   function showGate(mode, msg) {
@@ -961,21 +1139,39 @@ var DATA = null;
       if (!r || !r.key || (!DATA && !r.data)) { showGate('signin', 'Could not sign in. Try again.'); return; }
       setKey(r.key);
       hideGate();
-      if (DATA && unsaved()) { retryAll(); return; }
+      if (DATA && unsaved()) { writeCache(); retryAll(); return; }
       DATA = r.data || DATA;
+      /* After a reload at the sign-in screen the unsent changes were restored from the device: lay them over the data and send them. */
+      applyPending();
+      writeCache();
       keepScroll(render);
+      sendRestored();
     }, function (kind) {
       showGate('signin', kind === 'auth' ? 'That Google account is not allowed.' : 'Could not sign in. Check the connection and try again.');
     });
   }
   function boot() {
+    restorePending();
     if (!getKey()) { showGate('signin'); return; }
+    /* A key and a usable copy: show the app at once, then bring the server's data in quietly (refresh). Without a copy: the loading screen. */
+    var cached = DATA ? null : readCache();
+    if (cached) {
+      DATA = cached;
+      applyPending();
+      hideGate();
+      render();
+      if (!sendRestored()) refresh();
+      return;
+    }
     showGate('loading');
     api('getData', null, function (d) {
       if (!d || !d.habits) { showGate('error', 'Could not load your data. Try again.'); return; }
       DATA = d;
+      applyPending();
+      writeCache();
       hideGate();
       render();
+      sendRestored();
     }, function (kind) {
       if (kind === 'auth') return;
       showGate('error', kind === 'noapi' ? 'This app is not connected to its server yet.' : 'Could not load your data. Check the connection and try again.');
@@ -1053,6 +1249,8 @@ var DATA = null;
     var s = state.sync;
     el.className = 'pill' + (s === 'saved' ? '' : ' ' + s);
     el.innerHTML = '<i></i><span>' + (s === 'saving' ? 'Saving' : (s === 'error' ? 'Not saved, tap to retry' : 'Saved')) + '</span>';
+    var why = pillTitle();
+    if (why) { el.title = why; } else { el.removeAttribute('title'); }
   }
   function renderHeader() {
     var d = viewDate(), o = state.offset;
@@ -1778,7 +1976,7 @@ var DATA = null;
       '<label class="check"><input type="checkbox" id="s-retro"' + (state.settingsRetro ? ' checked' : '') + '> Also apply to past days</label>' +
       '<div class="hint">Changes to milestones and bonuses count from today; earlier days keep their scores. Tick this only to fix a mistake.</div>' +
       (state.settingsErr ? '<div class="err">' + esc(state.settingsErr) + '</div>' : '') +
-      '<div><button class="btn pri" data-act="set-save">Save settings</button></div></div></section>';
+      '<div><button class="btn pri" data-act="set-save">Save settings</button></div>' + saveLogHtml() + '</div></section>';
     return html;
   }
 
@@ -1913,12 +2111,15 @@ var DATA = null;
   }
   /* Edits go to the server one at a time, in order, so a quick move and undo can't arrive out of order
      (a delete overtaking the save that created the row would bring the row back). */
-  var callQueue = [], callBusy = false;
+  var callQueue = [], callBusy = false, curCall = null;
   function serverCall(fn, arg) {
     pendingEdits++;
+    editSeq++;
     state.sync = 'saving';
     renderPill();
     callQueue.push({ fn: fn, arg: arg });
+    persistPending();
+    scheduleCache();
     nextCall();
   }
   function nextCall() {
@@ -1930,34 +2131,175 @@ var DATA = null;
       if (!arg.length) { pendingEdits--; callDone(); return; }
     }
     callBusy = true;
+    curCall = c;
     api(c.fn, arg, function () {
       callBusy = false;
+      curCall = null;
       pendingEdits--;
+      retryTries = 0;
       callDone();
-    }, function () {
+    }, function (kind, info) {
       callBusy = false;
+      curCall = null;
       pendingEdits--;
       failedEdits.push({ fn: c.fn, arg: c.arg });
-      state.sync = 'error';
+      noteFail(c.fn, kind, info);
+      state.sync = failShown(kind);
       callDone();
     });
   }
   function callDone() {
+    persistPending();
     syncDone();
     renderPill();
     nextCall();
   }
   /* The pill once a save finishes: stays Saving while anything is still queued or on its way; otherwise
-     "Not saved" if anything failed (so a tap can retry it), else Saved. */
+     "Not saved" if anything failed (so a tap can retry it), else Saved. After a start from the device's copy or a
+     restore, the first time everything is saved there is one background refresh, so this device matches the server. */
   function syncDone() {
     if (pendingEdits || inFlight || flushTimer) return;
-    state.sync = failedEdits.length || queue.length ? 'error' : 'saved';
+    if (failedEdits.length || queue.length) {
+      /* Something is still unsaved: an automatic retry is already waiting, or is lined up now, or the tries are used up. */
+      armRetry();
+      state.sync = retryTimer ? 'saving' : 'error';
+      return;
+    }
+    state.sync = 'saved';
+    markRecovered();
+    if (convergeAfter) setTimeout(converge, 0);
   }
-  function retryAll() {
+  /* Deferred a tick, so that a retry that is still handing out its calls is not mistaken for "all saved". */
+  function converge() {
+    if (convergeAfter && state.sync === 'saved' && refresh()) convergeAfter = false;
+  }
+  /* Sends everything not confirmed: failed calls again (in their original order, through serverCall) and the habit queue. */
+  function sendAll() {
     var list = failedEdits.slice();
     failedEdits = [];
     for (var i = 0; i < list.length; i++) serverCall(list[i].fn, list[i].arg);
     flush();
+  }
+  /* The retry tap, signing in again and a restore: start over with a full set of automatic tries. */
+  function retryAll() {
+    cancelRetry();
+    retryTries = 0;
+    sendAll();
+  }
+
+  /* ---------- Retry: a failed save is tried again by itself, quietly ----------
+     After a failure other than 'auth' (and with a session key) a timer is set for RETRY_DELAYS_MS[retryTries]; when it
+     fires, sendAll() runs. While tries remain the pill says Saving; when they are used up it says "Not saved, tap to
+     retry". The count starts again on any confirmed save, a tap, coming back to the app and the online event. At most
+     one timer exists. The log below records why each save failed (see Save problems in Manage). */
+  function cancelRetry() { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } }
+  /* Something failed and nothing is sending it again (a habit batch counts only once it is no longer on its way). */
+  function needsRetry() { return !!(failedEdits.length || (queue.length && !inFlight && !flushTimer)); }
+  function armRetry() {
+    if (retryTimer) return true;
+    if (!getKey() || retryTries >= RETRY_DELAYS_MS.length || !needsRetry()) return false;
+    retryTimer = setTimeout(autoRetry, RETRY_DELAYS_MS[retryTries]);
+    return true;
+  }
+  function autoRetry() {
+    retryTimer = null;
+    if (!getKey() || !DATA || !needsRetry()) { syncDone(); renderPill(); return; }
+    retryTries++;
+    sendAll();
+  }
+  /* The pill after a failed save: Saving while an automatic try is lined up, otherwise "Not saved". */
+  function failShown(kind) {
+    if (kind === 'auth') return 'error';
+    return flushTimer || armRetry() ? 'saving' : 'error';
+  }
+  /* Coming back to the app, or the network returning: if anything is unsent and nothing is on its way, send it now
+     (a pending timer is dropped so nothing goes twice). A request still on its way is left alone; if it fails or times
+     out, the automatic retry picks it up. */
+  function resumeSaving() {
+    retryTries = 0;
+    if (!getKey() || !DATA || inFlight || callBusy || !needsRetry()) return;
+    cancelRetry();
+    sendAll();
+  }
+  /* Whether the page was hidden, or had just come back, when a call went out. */
+  function pageCtx() {
+    if (document.visibilityState === 'hidden') return 'hidden';
+    return returnedAt && Date.now() - returnedAt < 20000 ? 'returned' : 'visible';
+  }
+
+  /* The newest 20 save failures, kept on the device under muhasaba:savelog (every access in try/catch; with storage
+     blocked it lives in memory for the session). Entry: t time (ms), fn, kind, ctx (hidden / returned / visible), ms (time
+     to fail), r (automatic tries used when it failed), rec (the data was saved afterwards), tap (a tap was needed).
+     Nothing personal: no ids, no URL. */
+  var SAVELOG_KEY = 'muhasaba:savelog', SAVELOG_MAX = 20, saveLog = null;
+  function loadSaveLog() {
+    if (saveLog) return saveLog;
+    saveLog = [];
+    try {
+      var a = JSON.parse(lsGet(SAVELOG_KEY) || '[]');
+      for (var i = 0; Array.isArray(a) && i < a.length; i++) {
+        var e = a[i];
+        if (isObj(e) && typeof e.t === 'number' && typeof e.fn === 'string' && typeof e.kind === 'string') saveLog.push(e);
+      }
+    } catch (e2) {}
+    if (saveLog.length > SAVELOG_MAX) saveLog = saveLog.slice(-SAVELOG_MAX);
+    return saveLog;
+  }
+  function writeSaveLog() { lsSet(SAVELOG_KEY, JSON.stringify(saveLog || [])); }
+  /* A server's error text, trimmed and stripped of anything id-like or URL-like. */
+  function cleanKind(kind) {
+    return String(kind).replace(/https?:\/\/\S*/g, '').replace(/[A-Za-z0-9_-]{20,}/g, '...').replace(/\s+/g, ' ').replace(/^ | $/g, '').substring(0, 60) || 'bad';
+  }
+  function noteFail(fn, kind, info) {
+    var log = loadSaveLog();
+    log.push({ t: Date.now(), fn: String(fn).substring(0, 30), kind: cleanKind(kind), ctx: info && info.ctx ? info.ctx : 'visible', ms: info ? info.ms : 0, r: retryTries, rec: false, tap: false });
+    while (log.length > SAVELOG_MAX) log.shift();
+    writeSaveLog();
+  }
+  /* Everything is saved: the failures so far recovered. */
+  function markRecovered() {
+    var log = loadSaveLog(), changed = false;
+    for (var i = 0; i < log.length; i++) { if (!log[i].rec) { log[i].rec = true; changed = true; } }
+    if (changed) writeSaveLog();
+  }
+  function markTapped() {
+    var log = loadSaveLog(), changed = false;
+    for (var i = 0; i < log.length; i++) { if (!log[i].rec && !log[i].tap) { log[i].tap = true; changed = true; } }
+    if (changed) writeSaveLog();
+  }
+  function kindText(e) {
+    var k = e.kind;
+    if (k === 'network') return 'request failed (no connection)';
+    if (k === 'timeout') return 'no answer' + (e.ms ? ' after ' + Math.round(e.ms / 1000) + ' s' : '');
+    if (k === 'nonjson') return 'answer was not readable';
+    if (k === 'auth') return 'sign-in expired';
+    if (k === 'noapi') return 'no server set';
+    return 'server said: ' + k;
+  }
+  function ctxText(c) { return c === 'hidden' ? 'page was hidden' : (c === 'returned' ? 'just after returning' : ''); }
+  /* The reason of the failure that is still open, for the pill's title. */
+  function pillTitle() {
+    if (!(state.sync === 'error' || (state.sync === 'saving' && retryTimer))) return '';
+    var log = loadSaveLog();
+    for (var i = log.length - 1; i >= 0; i--) {
+      if (!log[i].rec) return (state.sync === 'error' ? 'Not saved: ' : 'Trying again after: ') + log[i].fn + ', ' + kindText(log[i]) + (ctxText(log[i].ctx) ? ', ' + ctxText(log[i].ctx) : '');
+    }
+    return '';
+  }
+  /* Manage, Settings: a small list of the failures (newest first), collapsed until opened; nothing when empty. */
+  function saveLogHtml() {
+    var log = loadSaveLog();
+    if (!log.length) return '';
+    var html = '<div class="savelog"><div class="savelog-head"><span class="savelog-title">Save problems (' + log.length + ')</span>' +
+      '<button class="linkish" data-act="log-toggle" aria-expanded="' + !!state.logOpen + '">' + (state.logOpen ? 'Hide' : 'Show') + '</button></div>';
+    if (state.logOpen) {
+      for (var i = log.length - 1; i >= 0; i--) {
+        var e = log[i], d = new Date(e.t), c = ctxText(e.ctx);
+        html += '<div class="savelog-row">' + d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ' - ' + esc(e.fn) + ': ' + esc(kindText(e)) +
+          (c ? ', ' + c : '') + (e.r ? ', after ' + e.r + (e.r === 1 ? ' retry' : ' retries') : '') + '. ' + (e.rec ? (e.tap ? 'Saved after a tap.' : 'Saved by itself.') : 'Not saved yet.') + '</div>';
+      }
+    }
+    return html + '</div>';
   }
   function saveHabitDraft() {
     var ed = state.editor, d = clone(ed.draft), c = d.config || {};
@@ -2921,7 +3263,8 @@ var DATA = null;
     else if (act === 'prev') { state.offset++; state.drawer = null; render(); }
     else if (act === 'next') { if (state.offset > 0 || (canGoForward() && state.offset > -365)) state.offset--; state.drawer = null; render(); }
     else if (act === 'nav') { if (t.getAttribute('data-prog')) state.progMode = t.getAttribute('data-prog'); state.view = t.getAttribute('data-view'); state.drawer = null; state.editor = null; state.sel = null; state.editTodo = null; state.settingsDraft = null; state.settingsErr = ''; state.settingsRetro = false; render(); document.getElementById('scroll').scrollTop = 0; window.scrollTo(0, 0); }
-    else if (act === 'retry') { if (state.sync === 'error') retryAll(); }
+    else if (act === 'retry') { if (state.sync === 'error' || retryTimer) { markTapped(); retryAll(); } }
+    else if (act === 'log-toggle') { state.logOpen = !state.logOpen; keepScroll(render); }
     else if (act === 'ring') { ringTap(); }
     else if (act === 'mcard-x') { closeMilestoneCard(); }
     else if (act === 'gcell') {
@@ -3177,10 +3520,17 @@ var DATA = null;
   setInterval(function () { checkDay(); }, 60000);
   window.addEventListener('focus', function () { checkDay(); });
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState !== 'visible') return;
+    if (document.visibilityState !== 'visible') { leaving(); return; }
+    returnedAt = Date.now();
     if (!checkDay()) render();
-    refresh();
+    /* Anything unsent goes out at once; the refresh below is skipped while it is unsaved, so ask for one once it is. */
+    resumeSaving();
+    if (!refresh() && DATA && getKey() && unsaved()) convergeAfter = true;
   });
+  /* The network came back: same as returning to the app. */
+  window.addEventListener('online', resumeSaving);
+  /* Leaving the page (closing, reloading, switching away on a phone): copy to the device, then send what is queued. */
+  window.addEventListener('pagehide', leaving);
 
   window.addEventListener('beforeunload', function (e) {
     if (queue.length || inFlight || pendingEdits || failedEdits.length) { e.preventDefault(); e.returnValue = ''; }
